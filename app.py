@@ -1,10 +1,8 @@
 """
 NyzMind Kokoro TTS API
 ======================
-A free, self-hosted Kokoro TTS API running on HuggingFace Spaces.
-
-Provides a simple REST API for text-to-speech using the Kokoro 82M model.
-Default voice: af_heart (warm, natural, feminine — perfect for Nyz).
+Optimized for Render.com free tier (512MB RAM).
+Model loads lazily on first request to avoid OOM during startup.
 
 Endpoints:
   GET  /health   — health check
@@ -13,6 +11,8 @@ Endpoints:
 """
 
 import io
+import os
+import gc
 import time
 import numpy as np
 import soundfile as sf
@@ -21,16 +21,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 
-# Kokoro imports — loaded at startup
-from kokoro import KModel, KPipeline
-
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="NyzMind Kokoro TTS", version="1.0.0")
 
-# CORS — allow requests from NyzMind web app and Android app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,14 +36,29 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Model loading (done once at startup)
+# Lazy model loading — only load when first TTS request comes in
 # ---------------------------------------------------------------------------
 
-print("[Kokoro] Loading model...")
-t0 = time.time()
-model = KModel().eval()
-pipeline = KPipeline(model=model, language_code='a')  # 'a' = American English
-print(f"[Kokoro] Model loaded in {time.time() - t0:.1f}s")
+_model = None
+_pipeline = None
+
+def get_pipeline():
+    """Load the Kokoro model lazily (only on first request)."""
+    global _model, _pipeline
+    if _pipeline is not None:
+        return _pipeline
+
+    print("[Kokoro] Loading model (first request)...")
+    t0 = time.time()
+
+    # Import here (not at module level) to save startup memory
+    from kokoro import KModel, KPipeline
+
+    _model = KModel().eval()
+    _pipeline = KPipeline(model=_model, language_code='a')
+
+    print(f"[Kokoro] Model loaded in {time.time() - t0:.1f}s")
+    return _pipeline
 
 # ---------------------------------------------------------------------------
 # Voice catalog
@@ -89,7 +100,7 @@ class TTSRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "kokoro-82m", "voices": len(VOICES)}
+    return {"status": "ok", "model": "kokoro-82m", "voices": len(VOICES), "loaded": _pipeline is not None}
 
 @app.get("/voices")
 async def voices():
@@ -105,9 +116,10 @@ async def text_to_speech(req: TTSRequest):
         )
 
     try:
-        # Generate audio using Kokoro
-        # KPipeline returns (graphemes, phonemes, audio) generator
-        # We collect all chunks and concatenate
+        # Load model lazily on first request
+        pipeline = get_pipeline()
+
+        # Generate audio
         chunks = []
         for graphemes, phonemes, audio in pipeline(req.text, voice=req.voice, speed=req.speed):
             if audio is not None:
@@ -116,7 +128,6 @@ async def text_to_speech(req: TTSRequest):
         if not chunks:
             raise HTTPException(status_code=500, detail="No audio generated")
 
-        # Concatenate all audio chunks
         full_audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
 
         # Convert to WAV bytes
@@ -124,13 +135,17 @@ async def text_to_speech(req: TTSRequest):
         sf.write(buf, full_audio, 24000, format='WAV', subtype='PCM_16')
         wav_bytes = buf.getvalue()
 
+        # Cleanup
+        del chunks, full_audio, buf
+        gc.collect()
+
         return Response(
             content=wav_bytes,
             media_type="audio/wav",
             headers={
-                "Content-Disposition": f'inline; filename="tts.wav"',
+                "Content-Disposition": 'inline; filename="tts.wav"',
                 "X-Voice": req.voice,
-                "X-Duration": f"{len(full_audio) / 24000:.2f}",
+                "X-Duration": f"{len(wav_bytes) / 48000:.2f}",
                 "Cache-Control": "no-cache",
             }
         )
@@ -153,9 +168,10 @@ async def root():
     }
 
 # ---------------------------------------------------------------------------
-# Main entry point (for HuggingFace Spaces Docker SDK)
+# Main — bind to PORT env var (Render sets this)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

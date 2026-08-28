@@ -1,8 +1,9 @@
-# Kokoro TTS + FastAPI
-# Pinned versions for stability on HuggingFace Spaces
+# Kokoro TTS + FastAPI — optimized for 512MB free tier
+# CPU-only torch (much smaller than full torch)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.1.0
 kokoro>=0.8.4
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 soundfile>=0.12.0
-numpy>=1.24.0
-torch>=2.1.0
+numpy>=1.24.0,<2.0.0
