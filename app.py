@@ -1,8 +1,9 @@
 """
-NyzMind Kokoro TTS API
-======================
+NyzMind Kokoro TTS API — ONNX Runtime edition
+=============================================
+Uses fastkokoro (ONNX Runtime) instead of PyTorch.
+Memory footprint: ~200MB instead of ~1GB.
 Optimized for Render.com free tier (512MB RAM).
-Model loads lazily on first request to avoid OOM during startup.
 
 Endpoints:
   GET  /health   — health check
@@ -10,12 +11,9 @@ Endpoints:
   POST /api/tts  — generate speech from text
 """
 
-import io
 import os
 import gc
 import time
-import numpy as np
-import soundfile as sf
 from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -25,7 +23,7 @@ from typing import Optional
 # App setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="NyzMind Kokoro TTS", version="1.0.0")
+app = FastAPI(title="NyzMind Kokoro TTS", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,26 +37,22 @@ app.add_middleware(
 # Lazy model loading — only load when first TTS request comes in
 # ---------------------------------------------------------------------------
 
-_model = None
-_pipeline = None
+_engine = None
 
-def get_pipeline():
-    """Load the Kokoro model lazily (only on first request)."""
-    global _model, _pipeline
-    if _pipeline is not None:
-        return _pipeline
+def get_engine():
+    """Load the Kokoro engine lazily (only on first request)."""
+    global _engine
+    if _engine is not None:
+        return _engine
 
-    print("[Kokoro] Loading model (first request)...")
+    print("[Kokoro] Loading ONNX engine (first request)...")
     t0 = time.time()
 
-    # Import here (not at module level) to save startup memory
-    from kokoro import KModel, KPipeline
+    from fastkokoro import FastKokoro
+    _engine = FastKokoro()
 
-    _model = KModel().eval()
-    _pipeline = KPipeline(model=_model, language_code='a')
-
-    print(f"[Kokoro] Model loaded in {time.time() - t0:.1f}s")
-    return _pipeline
+    print(f"[Kokoro] Engine loaded in {time.time() - t0:.1f}s")
+    return _engine
 
 # ---------------------------------------------------------------------------
 # Voice catalog
@@ -86,7 +80,7 @@ VOICES = [
 VALID_VOICE_IDS = {v["id"] for v in VOICES}
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Request model
 # ---------------------------------------------------------------------------
 
 class TTSRequest(BaseModel):
@@ -100,7 +94,7 @@ class TTSRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "kokoro-82m", "voices": len(VOICES), "loaded": _pipeline is not None}
+    return {"status": "ok", "model": "kokoro-82m-onnx", "voices": len(VOICES), "loaded": _engine is not None}
 
 @app.get("/voices")
 async def voices():
@@ -116,27 +110,23 @@ async def text_to_speech(req: TTSRequest):
         )
 
     try:
-        # Load model lazily on first request
-        pipeline = get_pipeline()
+        engine = get_engine()
 
-        # Generate audio
-        chunks = []
-        for graphemes, phonemes, audio in pipeline(req.text, voice=req.voice, speed=req.speed):
-            if audio is not None:
-                chunks.append(audio if isinstance(audio, np.ndarray) else np.array(audio))
+        # Generate audio using fastkokoro
+        audio = engine.create(
+            req.text,
+            voice=req.voice,
+            response_format="wav",
+        )
 
-        if not chunks:
-            raise HTTPException(status_code=500, detail="No audio generated")
+        # audio is bytes (WAV format)
+        if isinstance(audio, bytes):
+            wav_bytes = audio
+        elif hasattr(audio, 'read'):
+            wav_bytes = audio.read()
+        else:
+            wav_bytes = bytes(audio)
 
-        full_audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-
-        # Convert to WAV bytes
-        buf = io.BytesIO()
-        sf.write(buf, full_audio, 24000, format='WAV', subtype='PCM_16')
-        wav_bytes = buf.getvalue()
-
-        # Cleanup
-        del chunks, full_audio, buf
         gc.collect()
 
         return Response(
@@ -145,7 +135,6 @@ async def text_to_speech(req: TTSRequest):
             headers={
                 "Content-Disposition": 'inline; filename="tts.wav"',
                 "X-Voice": req.voice,
-                "X-Duration": f"{len(wav_bytes) / 48000:.2f}",
                 "Cache-Control": "no-cache",
             }
         )
@@ -162,7 +151,8 @@ async def text_to_speech(req: TTSRequest):
 async def root():
     return {
         "name": "NyzMind Kokoro TTS",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "engine": "onnx",
         "endpoints": ["/health", "/voices", "/api/tts"],
         "default_voice": "af_heart",
     }
