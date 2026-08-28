@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: nyzmind-kokoro-tts
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PORT
+        value: 7860
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
