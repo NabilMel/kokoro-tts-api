@@ -1,29 +1,18 @@
 """
-NyzMind Kokoro TTS API — ONNX Runtime edition
-=============================================
-Uses fastkokoro (ONNX Runtime) instead of PyTorch.
-Memory footprint: ~200MB instead of ~1GB.
-Optimized for Render.com free tier (512MB RAM).
-
-Endpoints:
-  GET  /health   — health check
-  GET  /voices   — list available voices
-  POST /api/tts  — generate speech from text
+NyzMind Kokoro TTS API — minimal ONNX edition
+Uses kokoro-onnx directly with pre-downloaded model files.
+Optimized for 512MB RAM free tier.
 """
-
 import os
 import gc
 import time
+import tempfile
 from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="NyzMind Kokoro TTS", version="2.0.0")
+app = FastAPI(title="NyzMind Kokoro TTS", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,30 +22,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Lazy model loading — only load when first TTS request comes in
-# ---------------------------------------------------------------------------
-
 _engine = None
+_model_dir = os.path.join(tempfile.gettempdir(), "kokoro-models")
 
 def get_engine():
-    """Load the Kokoro engine lazily (only on first request)."""
+    """Load the Kokoro ONNX engine lazily."""
     global _engine
     if _engine is not None:
         return _engine
 
-    print("[Kokoro] Loading ONNX engine (first request)...")
+    print("[Kokoro] Loading ONNX engine...")
     t0 = time.time()
 
-    from fastkokoro import FastKokoro
-    _engine = FastKokoro()
+    os.makedirs(_model_dir, exist_ok=True)
+
+    # Download model files if not present
+    model_path = os.path.join(_model_dir, "kokoro-v0_19.onnx")
+    voices_path = os.path.join(_model_dir, "voices-v1.0.bin")
+
+    if not os.path.exists(model_path):
+        print("[Kokoro] Downloading model (fp16)...")
+        import urllib.request
+        urllib.request.urlretrieve(
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v0_19.fp16.onnx",
+            model_path
+        )
+        print(f"[Kokoro] Model downloaded: {os.path.getsize(model_path) / 1024 / 1024:.1f}MB")
+
+    if not os.path.exists(voices_path):
+        print("[Kokoro] Downloading voices...")
+        import urllib.request
+        urllib.request.urlretrieve(
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
+            voices_path
+        )
+        print(f"[Kokoro] Voices downloaded: {os.path.getsize(voices_path) / 1024 / 1024:.1f}MB")
+
+    from kokoro_onnx import Kokoro
+    _engine = Kokoro(model_path, voices_path)
 
     print(f"[Kokoro] Engine loaded in {time.time() - t0:.1f}s")
     return _engine
 
-# ---------------------------------------------------------------------------
-# Voice catalog
-# ---------------------------------------------------------------------------
 
 VOICES = [
     {"id": "af_heart", "name": "Heart", "traits": "Warm, natural", "gender": "female"},
@@ -79,54 +86,44 @@ VOICES = [
 
 VALID_VOICE_IDS = {v["id"] for v in VOICES}
 
-# ---------------------------------------------------------------------------
-# Request model
-# ---------------------------------------------------------------------------
 
 class TTSRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=5000, description="Text to synthesize")
-    voice: str = Field("af_heart", description="Voice ID (see /voices)")
-    speed: Optional[float] = Field(1.0, ge=0.5, le=2.0, description="Speech speed multiplier")
+    text: str = Field(..., min_length=1, max_length=5000)
+    voice: str = Field("af_heart")
+    speed: Optional[float] = Field(1.0, ge=0.5, le=2.0)
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "model": "kokoro-82m-onnx", "voices": len(VOICES), "loaded": _engine is not None}
 
+
 @app.get("/voices")
 async def voices():
     return {"voices": VOICES, "default": "af_heart"}
 
+
 @app.post("/api/tts")
 async def text_to_speech(req: TTSRequest):
-    """Generate speech from text. Returns a WAV audio file."""
     if req.voice not in VALID_VOICE_IDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid voice '{req.voice}'. Valid voices: {sorted(VALID_VOICE_IDS)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid voice '{req.voice}'")
 
     try:
         engine = get_engine()
 
-        # Generate audio using fastkokoro
-        audio = engine.create(
-            req.text,
-            voice=req.voice,
-            response_format="wav",
-        )
+        import numpy as np
+        import soundfile as sf
+        import io
 
-        # audio is bytes (WAV format)
-        if isinstance(audio, bytes):
-            wav_bytes = audio
-        elif hasattr(audio, 'read'):
-            wav_bytes = audio.read()
-        else:
-            wav_bytes = bytes(audio)
+        # kokoro_onnx returns (sample_rate, audio_array)
+        samples, sample_rate = engine.create(req.text, req.voice, speed=req.speed)
 
+        # Convert to WAV
+        buf = io.BytesIO()
+        sf.write(buf, samples, sample_rate, format='WAV', subtype='PCM_16')
+        wav_bytes = buf.getvalue()
+
+        del samples, buf
         gc.collect()
 
         return Response(
@@ -138,7 +135,6 @@ async def text_to_speech(req: TTSRequest):
                 "Cache-Control": "no-cache",
             }
         )
-
     except HTTPException:
         raise
     except Exception as e:
@@ -147,21 +143,14 @@ async def text_to_speech(req: TTSRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
 
+
 @app.get("/")
 async def root():
-    return {
-        "name": "NyzMind Kokoro TTS",
-        "version": "2.0.0",
-        "engine": "onnx",
-        "endpoints": ["/health", "/voices", "/api/tts"],
-        "default_voice": "af_heart",
-    }
+    return {"name": "NyzMind Kokoro TTS", "version": "3.0.0", "engine": "onnx", "endpoints": ["/health", "/voices", "/api/tts"]}
 
-# ---------------------------------------------------------------------------
-# Main — bind to PORT env var (Render sets this)
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 7860))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    # Single worker to minimize memory
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", workers=1)
