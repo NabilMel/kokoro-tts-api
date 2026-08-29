@@ -1,7 +1,7 @@
-# Minimal Kokoro ONNX — uses ~150MB RAM
+# Minimal Kokoro ONNX
 kokoro-onnx>=0.4.0
 onnxruntime>=1.16.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 soundfile>=0.12.0
-numpy>=1.24.0,<2.0.0
+numpy>=2.0.2
