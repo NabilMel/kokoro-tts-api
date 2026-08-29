@@ -37,20 +37,21 @@ def get_engine():
     os.makedirs(_model_dir, exist_ok=True)
 
     # Download model files if not present
-    model_path = os.path.join(_model_dir, "kokoro-v0_19.onnx")
+    # int8 model = 92MB (smallest, best for 512MB RAM)
+    model_path = os.path.join(_model_dir, "kokoro-v1.0.int8.onnx")
     voices_path = os.path.join(_model_dir, "voices-v1.0.bin")
 
     if not os.path.exists(model_path):
-        print("[Kokoro] Downloading model (fp16)...")
+        print("[Kokoro] Downloading int8 model (92MB)...")
         import urllib.request
         urllib.request.urlretrieve(
-            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v0_19.fp16.onnx",
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx",
             model_path
         )
         print(f"[Kokoro] Model downloaded: {os.path.getsize(model_path) / 1024 / 1024:.1f}MB")
 
     if not os.path.exists(voices_path):
-        print("[Kokoro] Downloading voices...")
+        print("[Kokoro] Downloading voices (28MB)...")
         import urllib.request
         urllib.request.urlretrieve(
             "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
